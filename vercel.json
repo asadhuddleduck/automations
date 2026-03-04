@@ -1,0 +1,6 @@
+{
+  "crons": [
+    { "path": "/api/cron/toggl-sync", "schedule": "0 3 * * *" },
+    { "path": "/api/cron/recurring-tasks", "schedule": "0 0 * * 1-5" }
+  ]
+}
