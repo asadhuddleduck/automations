@@ -15,6 +15,7 @@ export async function GET(request: Request) {
     return Response.json({ error: "Unauthorized" }, { status: 401 });
   }
 
+  try {
   const today = new Date();
   const yesterday = new Date(today);
   yesterday.setUTCDate(today.getUTCDate() - 1);
@@ -55,8 +56,8 @@ export async function GET(request: Request) {
   const gameTime = formatTime(gameSeconds);
 
   // 3. Find yesterday's Daily page in Notion
-  const queryRes = await notion.dataSources.query({
-    data_source_id: DAILY_DB_ID,
+  const queryRes = await notion.databases.query({
+    database_id: DAILY_DB_ID,
     filter: {
       property: "Date",
       date: { equals: startDate },
@@ -92,4 +93,9 @@ export async function GET(request: Request) {
     trackedWork,
     gameTime,
   });
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error("[toggl-sync] Error:", message);
+    return Response.json({ error: message }, { status: 500 });
+  }
 }

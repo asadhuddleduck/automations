@@ -1,5 +1,5 @@
 import { notion } from "@/lib/notion";
-import type { CreatePageParameters } from "@notionhq/client/build/src/api-endpoints";
+import type { CreatePageParameters } from "@notionhq/client/build/src/api-endpoints.d";
 
 const RECURRING_TASKS_DB_ID = "2c384fd7-bc4e-8111-9c6b-f0912739341c";
 const ACTIONS_DB_ID = "2c384fd7-bc4e-81a1-b469-e33afbf19157";
@@ -14,8 +14,8 @@ export async function GET(request: Request) {
     const today = new Date().toISOString().slice(0, 10);
 
     // 1. Get all active recurring task templates
-    const templates = await notion.dataSources.query({
-      data_source_id: RECURRING_TASKS_DB_ID,
+    const templates = await notion.databases.query({
+      database_id: RECURRING_TASKS_DB_ID,
       filter: {
         property: "Active?",
         checkbox: { equals: true },
