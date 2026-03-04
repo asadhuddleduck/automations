@@ -28,7 +28,7 @@ export async function GET(request: Request) {
 
   const togglRes = await fetch(
     `https://api.track.toggl.com/api/v9/me/time_entries?start_date=${startDate}&end_date=${endDate}`,
-    { headers: { Authorization: `Basic ${basicAuth}` } }
+    { headers: { Authorization: `Basic ${basicAuth}`, "Content-Type": "application/json" } }
   );
 
   if (!togglRes.ok) {

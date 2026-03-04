@@ -10,88 +10,94 @@ export async function GET(request: Request) {
     return Response.json({ error: "Unauthorized" }, { status: 401 });
   }
 
-  const today = new Date().toISOString().slice(0, 10);
+  try {
+    const today = new Date().toISOString().slice(0, 10);
 
-  // 1. Get all active recurring task templates
-  const templates = await notion.dataSources.query({
-    data_source_id: RECURRING_TASKS_DB_ID,
-    filter: {
-      property: "Active?",
-      checkbox: { equals: true },
-    },
-  });
-
-  let created = 0;
-
-  // 2. Create an Actions page for each template
-  for (const template of templates.results) {
-    if (!("properties" in template)) continue;
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const props = template.properties as Record<string, any>;
-
-    // Extract title
-    const titleArr = props["Task"]?.title;
-    const title =
-      Array.isArray(titleArr) && titleArr.length > 0
-        ? titleArr[0].plain_text
-        : "Untitled Task";
-
-    // Extract driver (people)
-    const peopleArr = props["Driver"]?.people;
-    const driverIds =
-      Array.isArray(peopleArr) && peopleArr.length > 0
-        ? peopleArr.map((p: { id: string }) => ({ object: "user" as const, id: p.id }))
-        : [];
-
-    // Extract project relation (🏌🏽 Projects)
-    const relationArr = props["\u{1F3CC}\u{1F3FD} Projects"]?.relation;
-    const projectIds =
-      Array.isArray(relationArr) && relationArr.length > 0
-        ? relationArr.map((r: { id: string }) => ({ id: r.id }))
-        : [];
-
-    // Extract outcome (rich_text)
-    const richTextArr = props["Outcome"]?.rich_text;
-    const outcome =
-      Array.isArray(richTextArr) && richTextArr.length > 0
-        ? richTextArr[0].plain_text
-        : "";
-
-    // Build properties for new Actions page
-    const newPageProps: CreatePageParameters["properties"] = {
-      title: {
-        title: [{ text: { content: title } }],
+    // 1. Get all active recurring task templates
+    const templates = await notion.dataSources.query({
+      data_source_id: RECURRING_TASKS_DB_ID,
+      filter: {
+        property: "Active?",
+        checkbox: { equals: true },
       },
-      "Do date": {
-        date: { start: today },
-      },
-    };
-
-    if (driverIds.length > 0) {
-      newPageProps["Driver"] = { people: driverIds };
-    }
-
-    if (projectIds.length > 0) {
-      newPageProps["Client/Projects"] = { relation: projectIds };
-    }
-
-    if (outcome) {
-      newPageProps["Outcome"] = {
-        rich_text: [{ text: { content: outcome } }],
-      };
-    }
-
-    await notion.pages.create({
-      parent: { database_id: ACTIONS_DB_ID },
-      properties: newPageProps,
     });
 
-    created++;
-  }
+    let created = 0;
 
-  return Response.json({
-    success: true,
-    date: today,
-    tasksCreated: created,
-  });
+    // 2. Create an Actions page for each template
+    for (const template of templates.results) {
+      if (!("properties" in template)) continue;
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const props = template.properties as Record<string, any>;
+
+      // Extract title
+      const titleArr = props["Task"]?.title;
+      const title =
+        Array.isArray(titleArr) && titleArr.length > 0
+          ? titleArr[0].plain_text
+          : "Untitled Task";
+
+      // Extract driver (people)
+      const peopleArr = props["Driver"]?.people;
+      const driverIds =
+        Array.isArray(peopleArr) && peopleArr.length > 0
+          ? peopleArr.map((p: { id: string }) => ({ object: "user" as const, id: p.id }))
+          : [];
+
+      // Extract project relation (🏌🏽 Projects)
+      const relationArr = props["\u{1F3CC}\u{1F3FD} Projects"]?.relation;
+      const projectIds =
+        Array.isArray(relationArr) && relationArr.length > 0
+          ? relationArr.map((r: { id: string }) => ({ id: r.id }))
+          : [];
+
+      // Extract outcome (rich_text)
+      const richTextArr = props["Outcome"]?.rich_text;
+      const outcome =
+        Array.isArray(richTextArr) && richTextArr.length > 0
+          ? richTextArr[0].plain_text
+          : "";
+
+      // Build properties for new Actions page
+      const newPageProps: CreatePageParameters["properties"] = {
+        title: {
+          title: [{ text: { content: title } }],
+        },
+        "Do date": {
+          date: { start: today },
+        },
+      };
+
+      if (driverIds.length > 0) {
+        newPageProps["Driver"] = { people: driverIds };
+      }
+
+      if (projectIds.length > 0) {
+        newPageProps["Client/Projects"] = { relation: projectIds };
+      }
+
+      if (outcome) {
+        newPageProps["Outcome"] = {
+          rich_text: [{ text: { content: outcome } }],
+        };
+      }
+
+      await notion.pages.create({
+        parent: { database_id: ACTIONS_DB_ID },
+        properties: newPageProps,
+      });
+
+      created++;
+    }
+
+    return Response.json({
+      success: true,
+      date: today,
+      tasksCreated: created,
+    });
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error("[recurring-tasks] Error:", message);
+    return Response.json({ error: message }, { status: 500 });
+  }
 }
