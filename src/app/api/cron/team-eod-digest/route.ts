@@ -71,6 +71,15 @@ function scorecardWorkDay(page: AnyProps): string {
 
 // Assistant reply addressed to the team member. Returns null on any failure so
 // the caller degrades gracefully (roll-up still writes, no comment posted).
+type PrevContext = {
+  day: string;
+  output: number | null;
+  winBlocker: string;
+  botCommented: boolean; // did we leave a note on that row?
+  replied: boolean; // did THIS member reply after our note?
+  replyText: string;
+};
+
 async function assistantComment(input: {
   name: string;
   hours: string;
@@ -78,6 +87,7 @@ async function assistantComment(input: {
   clean: boolean;
   winBlocker: string;
   recentOutputs: (number | null)[]; // prior work-days, newest first, excl. today
+  prev: PrevContext | null; // their previous scorecard + whether they replied
 }): Promise<string | null> {
   const key = process.env.ANTHROPIC_API_KEY;
   if (!key) return null;
@@ -88,6 +98,19 @@ async function assistantComment(input: {
         .map((o) => (o ?? "n/a"))
         .join(", ")}]. Zero-output days in that stretch: ${zeroDays} of ${input.recentOutputs.length}.`
     : "No prior scorecards in the last two weeks.";
+
+  let prevBlock = "No previous scorecard to compare against.";
+  if (input.prev) {
+    const p = input.prev;
+    prevBlock = `Their previous work-day (${p.day}): Output ${p.output ?? "n/a"}. Win + blocker: ${
+      p.winBlocker || "(blank)"
+    }.`;
+    if (p.botCommented) {
+      prevBlock += p.replied
+        ? ` After your note that day, they replied: "${p.replyText}".`
+        : ` They did NOT reply to your note that day.`;
+    }
+  }
 
   const prompt = `You are Asad's end-of-day accountability assistant for his team. You review a team member's daily EOD scorecard and reply DIRECTLY TO THEM (address them as "you"), in Asad's assistant voice: warm and encouraging, but no-BS. Asad reads every one of these, so they should feel his attention on their scorecard.
 
@@ -106,6 +129,7 @@ Output: ${input.output ?? "(blank)"}
 All clean?: ${input.clean ? "Yes" : "No"}
 Win + blocker: ${input.winBlocker || "(blank)"}
 ${trend}
+${prevBlock}
 
 Write a 2-4 sentence reply to ${input.name}:
 - If there is a genuine, specific win, name it and give real credit. Do NOT celebrate a vague or unsubstantiated win, and do NOT celebrate if Output is 0 or the hours do not support it — instead ask what actually shipped.
@@ -114,6 +138,7 @@ Write a 2-4 sentence reply to ${input.name}:
 - Keep it tight and human (2-3 sentences is plenty). Do not repeat their name at the start (they are already tagged). No greeting, no sign-off.
 - Write the way Asad actually texts: plain and direct. NEVER use em dashes or en dashes (—, –) anywhere; use full stops, commas, or brackets instead. No corporate or hype words (leverage, unlock, throughput, compound, deliverable-speak). Do not use the "not X, it's Y" construction.
 - Do not invent statistics. If you mention how many zero-output days there have been, use exactly the numbers given in the "Recent output" line above and nothing else.
+- Use the previous work-day line for continuity, briefly. If they replied to your last note, acknowledge what they said and hold them to it. If they did NOT reply to your last note (especially if you asked for their real blocker), point that out plainly and ask again. Do not repeat your previous note word for word.
 
 Return ONLY the reply text: no preamble, no reasoning, no quotes, no headers.`;
 
@@ -191,6 +216,8 @@ type MemberResult = {
   comment?: string | null;
   posted?: boolean;
   alreadyCommented?: boolean;
+  prevDay?: string | null;
+  prevReplied?: boolean | null; // null = no prior note of ours to reply to
 };
 
 export async function GET(request: Request) {
@@ -275,10 +302,59 @@ export async function GET(request: Request) {
         const cur = byDay.get(c.workDay);
         if (!cur || c.createdTime > cur.createdTime) byDay.set(c.workDay, c);
       }
-      const recentOutputs = [...byDay.entries()]
-        .sort((a, b) => (a[0] < b[0] ? 1 : -1))
+      const priorDaysDesc = [...byDay.entries()].sort((a, b) => (a[0] < b[0] ? 1 : -1));
+      const recentOutputs = priorDaysDesc
         .slice(0, 5)
         .map(([, c]) => c.props.Output?.number ?? null);
+
+      // Previous scorecard (their most recent prior submission) + did they reply
+      // to the note we left on it? Gives the daily nudge continuity/memory.
+      let prev: PrevContext | null = null;
+      const prevEntry = priorDaysDesc[0] ?? null;
+      if (prevEntry) {
+        const [prevDay, prevCard] = prevEntry;
+        let botCommented = false;
+        let replied = false;
+        let replyText = "";
+        try {
+          const cs = await notion.comments.list({ block_id: prevCard.id });
+          const sorted = [...cs.results].sort((a, b) =>
+            ((a.created_time as string) < (b.created_time as string) ? -1 : 1),
+          );
+          const lastBot = [...sorted]
+            .reverse()
+            .find((c) => botId != null && (c.created_by as AnyProps)?.id === botId);
+          botCommented = !!lastBot;
+          if (lastBot) {
+            const after = sorted.filter(
+              (c) =>
+                (c.created_time as string) > (lastBot.created_time as string) &&
+                (c.created_by as AnyProps)?.id === member.id,
+            );
+            if (after.length) {
+              replied = true;
+              replyText = after
+                .map((c) =>
+                  ((c as AnyProps).rich_text || [])
+                    .map((r: AnyProps) => r.plain_text ?? "")
+                    .join(""),
+                )
+                .join(" | ")
+                .trim();
+            }
+          }
+        } catch (err) {
+          console.error("[team-eod-digest] prev comments.list failed:", err);
+        }
+        prev = {
+          day: prevDay,
+          output: prevCard.props.Output?.number ?? null,
+          winBlocker: richText(prevCard.props["Win + blocker"]),
+          botCommented,
+          replied,
+          replyText,
+        };
+      }
 
       const comment = await assistantComment({
         name: member.name,
@@ -287,6 +363,7 @@ export async function GET(request: Request) {
         clean,
         winBlocker,
         recentOutputs,
+        prev,
       });
 
       // Idempotency: has our bot already commented on this row?
@@ -328,6 +405,8 @@ export async function GET(request: Request) {
         comment,
         posted,
         alreadyCommented,
+        prevDay: prev?.day ?? null,
+        prevReplied: prev?.botCommented ? prev.replied : null,
       });
     }
 
@@ -362,6 +441,11 @@ export async function GET(request: Request) {
           }`,
         ),
       );
+      if (r.prevReplied != null) {
+        blocks.push(
+          para(`Replied to ${r.prevDay ?? "last"} note: ${r.prevReplied ? "Yes ✅" : "No ⚠️"}`),
+        );
+      }
       if (r.comment) {
         const status = r.posted
           ? " (posted)"
