@@ -1,23 +1,33 @@
 import { notion } from "@/lib/notion";
 
-// Rebuild of the team-EOD digest writer that died in the 10 May 2026 Notion AI
-// feature downgrade (same incident that forced the notion-view.js shim). This
-// runs in code instead of relying on a Notion-native AI automation.
+// Team-EOD accountability assistant.
 //
-// Flow each weekday morning:
-//   1. Find today's "Review yesterday's team EOD reports" Actions page (created
-//      by the midnight recurring-tasks cron).
-//   2. Find the latest prior work-day that has scorecards (skips weekends).
-//   3. For each roster member, build a Hours/Output/Clean line + Claude-written
-//      coaching bullets from their Win+blocker. Missing member -> follow-up note.
-//   4. Append the digest blocks to the task body (idempotent — skips if already
-//      filled).
+// Replaces the claude.ai cloud routine "⚡ Daily Team EOD Review" (silenced
+// 7 Jul 2026) AND corrects the 25 May code rebuild, which wrongly wrote
+// founder-facing coaching to Asad. This version is TEAM-FACING: each weekday
+// morning it reviews yesterday's scorecards and, for each team member, posts a
+// comment ON THEIR scorecard row (@mentioning them) in Asad's assistant voice —
+// praising only substantiated wins, and calling out skipped/faked blockers and
+// zero-output days against the standard written into the scorecard's own field
+// descriptions (Hormozi EOD: the blocker is the ONE binding constraint, never
+// "none"). It also writes a compliance roll-up into Asad's "Review yesterday's
+// team EOD reports" task so he can audit what was posted.
+//
+// Flow (GET, weekday cron 30 6 * * 1-5):
+//   1. Pull recent scorecards; pick the latest prior work-day with data.
+//   2. For each roster member: take their LATEST submission for that day, build
+//      a trend line, ask Claude for a reply addressed to them.
+//   3. Auto-post that reply as a comment on their scorecard row (idempotent:
+//      skips if our bot already commented on the row).
+//   4. Append a compliance roll-up to Asad's review task (idempotent: skips if
+//      the body already has blocks).
+// ?dry=1 generates everything and returns it as JSON without posting/appending.
 
 const ACTIONS_DB_ID = "2c384fd7-bc4e-81a1-b469-e33afbf19157";
 const SCORECARDS_DB_ID = "9dfdc9d7735941088a66b4c8978a54ca";
 const SCORECARDS_URL = "https://www.notion.so/9dfdc9d7735941088a66b4c8978a54ca";
 const REVIEW_TASK_TITLE = "Review yesterday's team EOD reports";
-const LOOKBACK_DAYS = 4; // covers a weekend + a bank holiday
+const LOOKBACK_DAYS = 14; // 2 weeks of history for trend context
 
 // Expected team roster. Missing member on the target day -> "No EOD submitted".
 const ROSTER: { id: string; name: string }[] = [
@@ -59,19 +69,53 @@ function scorecardWorkDay(page: AnyProps): string {
   return (page.created_time as string).slice(0, 10);
 }
 
-async function claudeBullets(input: {
+// Assistant reply addressed to the team member. Returns null on any failure so
+// the caller degrades gracefully (roll-up still writes, no comment posted).
+async function assistantComment(input: {
   name: string;
   hours: string;
   output: number | null;
   clean: boolean;
   winBlocker: string;
-}): Promise<string[]> {
+  recentOutputs: (number | null)[]; // prior work-days, newest first, excl. today
+}): Promise<string | null> {
   const key = process.env.ANTHROPIC_API_KEY;
-  if (!key) return [];
-  const prompt = `You are coaching Asad (the founder) on his team member's end-of-day report. Write 2-3 short, specific coaching bullets addressed to Asad about ${input.name}'s day. Reference their actual numbers and their win/blocker. Be direct and useful — flag anything worth Asad acting on (low output, repeated blockers, wins to reinforce). No preamble, no headers. Return ONLY the bullets, one per line, no bullet characters.
+  if (!key) return null;
 
-${input.name} — Hours: ${input.hours || "n/a"} | Output: ${input.output ?? "n/a"} | All clean: ${input.clean ? "Yes" : "No"}
-Win + blocker: ${input.winBlocker || "(none submitted)"}`;
+  const zeroDays = input.recentOutputs.filter((o) => (o ?? 0) === 0).length;
+  const trend = input.recentOutputs.length
+    ? `Recent output before today (newest first): [${input.recentOutputs
+        .map((o) => (o ?? "n/a"))
+        .join(", ")}]. Zero-output days in that stretch: ${zeroDays} of ${input.recentOutputs.length}.`
+    : "No prior scorecards in the last two weeks.";
+
+  const prompt = `You are Asad's end-of-day accountability assistant for his team. You review a team member's daily EOD scorecard and reply DIRECTLY TO THEM (address them as "you"), in Asad's assistant voice: warm and encouraging, but no-BS. Asad reads every one of these, so they should feel his attention on their scorecard.
+
+The reporting standard (from the scorecard's own field descriptions — hold them to it):
+- Win + blocker: one sentence on the biggest thing they SHIPPED today, AND one sentence on their single biggest blocker. Both sentences are mandatory.
+- Output: number of deliverables that LEFT THEIR HANDS today (not effort, not learning, not activity).
+- Hours: time actively executing (meetings, planning, and gaps do not count).
+- All clean?: honest — unticked if anything shipped had avoidable errors, missed follow-ups, or rework.
+
+What a real blocker is (this is where they cut corners): the ONE binding constraint, the single thing that, if removed, would let them do more or better tomorrow. There is ALWAYS one. It is NOT "nothing blocked me" or "none", and it is NOT an environmental grumble like "internet was down" or "no work assigned" unless that genuinely is the main thing limiting how much they get done and they say what they need to clear it.
+
+Their report for today:
+Name: ${input.name}
+Hours: ${input.hours || "(blank)"}
+Output: ${input.output ?? "(blank)"}
+All clean?: ${input.clean ? "Yes" : "No"}
+Win + blocker: ${input.winBlocker || "(blank)"}
+${trend}
+
+Write a 2-4 sentence reply to ${input.name}:
+- If there is a genuine, specific win, name it and give real credit. Do NOT celebrate a vague or unsubstantiated win, and do NOT celebrate if Output is 0 or the hours do not support it — instead ask what actually shipped.
+- If the blocker is missing, "none", or an environmental excuse, tell them plainly that is not a blocker and ask for their real constraint: the one thing slowing them from doing better, and what they need from Asad to clear it.
+- If Output is 0 (or it is another zero-output day in the trend), push them to turn the effort into one concrete deliverable that leaves their hands tomorrow.
+- Keep it tight and human (2-3 sentences is plenty). Do not repeat their name at the start (they are already tagged). No greeting, no sign-off.
+- Write the way Asad actually texts: plain and direct. NEVER use em dashes or en dashes (—, –) anywhere; use full stops, commas, or brackets instead. No corporate or hype words (leverage, unlock, throughput, compound, deliverable-speak). Do not use the "not X, it's Y" construction.
+- Do not invent statistics. If you mention how many zero-output days there have been, use exactly the numbers given in the "Recent output" line above and nothing else.
+
+Return ONLY the reply text: no preamble, no reasoning, no quotes, no headers.`;
 
   try {
     const res = await fetch("https://api.anthropic.com/v1/messages", {
@@ -82,27 +126,32 @@ Win + blocker: ${input.winBlocker || "(none submitted)"}`;
         "anthropic-version": "2023-06-01",
       },
       body: JSON.stringify({
-        model: "claude-sonnet-4-6",
+        model: "claude-opus-4-8",
         max_tokens: 400,
         messages: [{ role: "user", content: prompt }],
       }),
     });
     if (!res.ok) {
       console.error("[team-eod-digest] Claude error:", res.status, await res.text());
-      return [];
+      return null;
     }
     const data = await res.json();
-    const text: string = data?.content?.[0]?.text ?? "";
-    return text
-      .split("\n")
-      .map((l) => l.replace(/^[\s\-*•\d.]+/, "").trim())
-      .filter(Boolean);
+    // Join text blocks (robust even if a thinking block ever appears first).
+    const text: string = Array.isArray(data?.content)
+      ? data.content
+          .filter((b: AnyProps) => b.type === "text")
+          .map((b: AnyProps) => b.text ?? "")
+          .join("")
+          .trim()
+      : "";
+    return text || null;
   } catch (err) {
     console.error("[team-eod-digest] Claude fetch failed:", err);
-    return [];
+    return null;
   }
 }
 
+// --- block builders (founder roll-up) ---
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 const h2 = (text: string): any => ({
   object: "block",
@@ -116,12 +165,6 @@ const para = (text: string): any => ({
   paragraph: { rich_text: [{ type: "text", text: { content: text } }] },
 });
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-const numbered = (text: string): any => ({
-  object: "block",
-  type: "numbered_list_item",
-  numbered_list_item: { rich_text: [{ type: "text", text: { content: text } }] },
-});
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
 const link = (label: string, url: string): any => ({
   object: "block",
   type: "paragraph",
@@ -130,16 +173,38 @@ const link = (label: string, url: string): any => ({
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 const divider = (): any => ({ object: "block", type: "divider", divider: {} });
 
+type Card = {
+  person: string | null;
+  workDay: string;
+  createdTime: string;
+  props: AnyProps;
+  id: string;
+};
+
+type MemberResult = {
+  name: string;
+  submitted: boolean;
+  hours?: string;
+  output?: number | null;
+  clean?: boolean;
+  winBlocker?: string;
+  comment?: string | null;
+  posted?: boolean;
+  alreadyCommented?: boolean;
+};
+
 export async function GET(request: Request) {
   const authHeader = request.headers.get("authorization");
   if (authHeader !== `Bearer ${process.env.CRON_SECRET}`) {
     return Response.json({ error: "Unauthorized" }, { status: 401 });
   }
 
+  const dry = new URL(request.url).searchParams.get("dry") === "1";
+
   try {
     const today = londonDate(0);
 
-    // 1. Find today's review task.
+    // Founder roll-up target (may be absent on weekends / if not yet created).
     const tasks = await notion.databases.query({
       database_id: ACTIONS_DB_ID,
       filter: {
@@ -149,24 +214,14 @@ export async function GET(request: Request) {
         ],
       },
     });
-    if (tasks.results.length === 0) {
-      return Response.json({ skipped: "no review task for today", date: today });
-    }
-    const taskPage = tasks.results[0];
+    const taskPage = tasks.results[0] ?? null;
 
-    // Idempotency: skip if the body already has blocks.
-    const existing = await notion.blocks.children.list({ block_id: taskPage.id, page_size: 1 });
-    if (existing.results.length > 0) {
-      return Response.json({ skipped: "body already populated", taskId: taskPage.id });
-    }
-
-    // 2. Pull recent scorecards and pick the latest prior work-day with data.
+    // 1. Pull recent scorecards, pick the latest prior work-day with data.
     const cutoff = londonDate(-LOOKBACK_DAYS);
     const scorecards = await notion.databases.query({
       database_id: SCORECARDS_DB_ID,
-      page_size: 50,
+      page_size: 100,
     });
-    type Card = { person: string | null; workDay: string; props: AnyProps; id: string };
     const cards: Card[] = scorecards.results
       .map((r) => {
         const props = ("properties" in r ? r.properties : {}) as AnyProps;
@@ -174,6 +229,7 @@ export async function GET(request: Request) {
         return {
           person: people[0]?.id ?? null,
           workDay: scorecardWorkDay(r as AnyProps),
+          createdTime: ("created_time" in r ? (r.created_time as string) : "") ?? "",
           props,
           id: r.id,
         };
@@ -185,43 +241,156 @@ export async function GET(request: Request) {
     }
     const targetDay = cards.map((c) => c.workDay).sort().reverse()[0];
 
-    // 3. Build the digest per roster member.
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const blocks: any[] = [];
-    for (let i = 0; i < ROSTER.length; i++) {
-      const member = ROSTER[i];
-      const card = cards.find((c) => c.person === member.id && c.workDay === targetDay);
-      if (i > 0) blocks.push(divider());
-      blocks.push(h2(`${member.name} — ${targetDay}`));
+    // Our integration's bot user id — used for comment idempotency.
+    let botId: string | null = null;
+    try {
+      botId = ((await notion.users.me({})) as AnyProps).id ?? null;
+    } catch (err) {
+      console.error("[team-eod-digest] users.me failed:", err);
+    }
+
+    // 2. + 3. Per member: pick latest submission, coach, post comment.
+    const results: MemberResult[] = [];
+    for (const member of ROSTER) {
+      // Latest submission for the target day (fixes duplicate same-day rows).
+      const card =
+        cards
+          .filter((c) => c.person === member.id && c.workDay === targetDay)
+          .sort((a, b) => (a.createdTime < b.createdTime ? 1 : -1))[0] ?? null;
 
       if (!card) {
-        blocks.push(para("⚠️ No EOD submitted. Follow up with them."));
+        results.push({ name: member.name, submitted: false });
         continue;
       }
+
       const hours = richText(card.props.Hours);
       const output = card.props.Output?.number ?? null;
       const clean = card.props["All clean?"]?.checkbox ?? false;
       const winBlocker = richText(card.props["Win + blocker"]);
 
-      blocks.push(para(`Hours: ${hours || "n/a"} | Output: ${output ?? "n/a"} | Clean: ${clean ? "Yes" : "No"}`));
-      const bullets = await claudeBullets({ name: member.name, hours, output, clean, winBlocker });
-      if (bullets.length > 0) {
-        bullets.forEach((b) => blocks.push(numbered(b)));
-      } else if (winBlocker) {
-        blocks.push(para(winBlocker));
+      // Trend: last 5 prior work-days for this member (latest row per day).
+      const byDay = new Map<string, Card>();
+      for (const c of cards) {
+        if (c.person !== member.id || c.workDay >= targetDay) continue;
+        const cur = byDay.get(c.workDay);
+        if (!cur || c.createdTime > cur.createdTime) byDay.set(c.workDay, c);
+      }
+      const recentOutputs = [...byDay.entries()]
+        .sort((a, b) => (a[0] < b[0] ? 1 : -1))
+        .slice(0, 5)
+        .map(([, c]) => c.props.Output?.number ?? null);
+
+      const comment = await assistantComment({
+        name: member.name,
+        hours,
+        output,
+        clean,
+        winBlocker,
+        recentOutputs,
+      });
+
+      // Idempotency: has our bot already commented on this row?
+      let alreadyCommented = false;
+      try {
+        const existing = await notion.comments.list({ block_id: card.id });
+        alreadyCommented = existing.results.some(
+          (c) => botId != null && (c.created_by as AnyProps)?.id === botId,
+        );
+      } catch (err) {
+        console.error("[team-eod-digest] comments.list failed:", err);
+      }
+
+      let posted = false;
+      if (comment && !dry && !alreadyCommented) {
+        try {
+          await notion.comments.create({
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            parent: { page_id: card.id } as any,
+            rich_text: [
+              // eslint-disable-next-line @typescript-eslint/no-explicit-any
+              { type: "mention", mention: { type: "user", user: { id: member.id } } } as any,
+              { type: "text", text: { content: " " + comment } },
+            ],
+          });
+          posted = true;
+        } catch (err) {
+          console.error("[team-eod-digest] comment post failed:", member.name, err);
+        }
+      }
+
+      results.push({
+        name: member.name,
+        submitted: true,
+        hours,
+        output,
+        clean,
+        winBlocker,
+        comment,
+        posted,
+        alreadyCommented,
+      });
+    }
+
+    // 4. Founder roll-up (compliance scan + audit of what was posted).
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const blocks: any[] = [];
+    blocks.push(h2(`Team EOD — ${targetDay}`));
+    blocks.push(
+      para(
+        "Submitted: " +
+          results
+            .map((r) => (r.submitted ? `✅ ${r.name}` : `⚠️ ${r.name} — NO REPORT`))
+            .join("   ·   "),
+      ),
+    );
+    for (const r of results) {
+      blocks.push(divider());
+      blocks.push(h2(r.name));
+      if (!r.submitted) {
+        blocks.push(para(`⚠️ No EOD submitted for ${targetDay}. Chase them.`));
+        continue;
+      }
+      blocks.push(
+        para(
+          `Hours: ${r.hours || "n/a"} | Output: ${r.output ?? "n/a"} | Clean: ${r.clean ? "Yes" : "No"}`,
+        ),
+      );
+      blocks.push(
+        para(
+          `${(r.output ?? 0) > 0 ? "Output shipped ✅" : "Output 0 ⚠️"} · All clean: ${
+            r.clean ? "Yes" : "No"
+          }`,
+        ),
+      );
+      if (r.comment) {
+        const status = r.posted
+          ? " (posted)"
+          : r.alreadyCommented
+          ? " (already posted)"
+          : dry
+          ? " (dry-run — not posted)"
+          : " (not posted)";
+        blocks.push(para(`Assistant → ${r.name}${status}:`));
+        blocks.push(para(r.comment));
       }
       blocks.push(link("→ Open scorecard", SCORECARDS_URL));
     }
 
-    // 4. Write to the task body.
-    await notion.blocks.children.append({ block_id: taskPage.id, children: blocks });
+    let bodyWritten = false;
+    if (!dry && taskPage) {
+      const existing = await notion.blocks.children.list({ block_id: taskPage.id, page_size: 1 });
+      if (existing.results.length === 0) {
+        await notion.blocks.children.append({ block_id: taskPage.id, children: blocks });
+        bodyWritten = true;
+      }
+    }
 
     return Response.json({
-      success: true,
-      taskId: taskPage.id,
+      dry,
       targetDay,
-      members: ROSTER.length,
-      blocksWritten: blocks.length,
+      taskId: taskPage?.id ?? null,
+      bodyWritten,
+      results,
     });
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : String(err);
