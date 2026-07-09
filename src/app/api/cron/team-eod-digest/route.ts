@@ -10,21 +10,22 @@ import { notion } from "@/lib/notion";
 // constraint, never "none"). It praises only substantiated wins and calls out
 // skipped/faked blockers + zero-output days, with prev-day continuity.
 //
+// The founder surface is SLACK (#ai-convo-landing-page) — a concise daily digest
+// with escalations, per-person status, scorecard links, and (Mondays) a
+// prior-week review. There is NO daily Notion task (the recurring review task was
+// retired 9 Jul 2026 — it cluttered Asad's Actions).
+//
 // Flow (GET, weekday cron 30 6 * * 1-5):
 //   1. Pull recent scorecards.
-//   2. Per member: take their LATEST scorecard (any day within lookback). If our
-//      bot already commented it, skip; else coach + post a comment on that row.
+//   2. Per member: take their LATEST scorecard within lookback. If our bot
+//      already commented it, skip; else coach + post a comment on that row.
 //      Decoupled per person, so a miss/late/weekend row on one doesn't affect the
 //      other, and an older un-reviewed row still gets picked up.
-//   3. Write a founder roll-up (escalations first) to Asad's review task.
-//   4. Post a concise founder digest to Slack (#ai-convo-landing-page).
-//   5. On Mondays, add a prior-week review (founder-facing only).
-// ?dry=1 generates everything and returns it as JSON without posting/appending.
+//   3. Post a founder digest to Slack (once per real run, when new comments post).
+// ?dry=1 generates everything and returns it as JSON (incl. the Slack preview)
+// without posting anything.
 
-const ACTIONS_DB_ID = "2c384fd7-bc4e-81a1-b469-e33afbf19157";
 const SCORECARDS_DB_ID = "9dfdc9d7735941088a66b4c8978a54ca";
-const SCORECARDS_URL = "https://www.notion.so/9dfdc9d7735941088a66b4c8978a54ca";
-const REVIEW_TASK_TITLE = "Review yesterday's team EOD reports";
 const LOOKBACK_DAYS = 14; // 2 weeks of history for trend + weekly context
 
 // Expected team roster.
@@ -75,6 +76,9 @@ function previousWorkday(iso: string): string {
 function scorecardRowUrl(id: string): string {
   return `https://www.notion.so/${id.replace(/-/g, "")}`;
 }
+function snip(s: string, n: number): string {
+  return s.length > n ? s.slice(0, n).trimEnd() + "…" : s;
+}
 
 // The work-day a scorecard reports for lives in its title as a leading ISO
 // datetime; fall back to created_time if the title isn't parseable.
@@ -95,7 +99,7 @@ type PrevContext = {
 };
 
 // Assistant reply addressed to the team member. Returns null on any failure so
-// the caller degrades gracefully (roll-up still writes, no comment posted).
+// the caller degrades gracefully (no comment posted).
 async function assistantComment(input: {
   name: string;
   hours: string;
@@ -248,28 +252,6 @@ async function postSlack(text: string, alert: boolean): Promise<boolean> {
   }
 }
 
-// --- block builders (founder roll-up) ---
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-const h2 = (text: string): any => ({
-  object: "block",
-  type: "heading_2",
-  heading_2: { rich_text: [{ type: "text", text: { content: text } }] },
-});
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-const para = (text: string): any => ({
-  object: "block",
-  type: "paragraph",
-  paragraph: { rich_text: [{ type: "text", text: { content: text } }] },
-});
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-const link = (label: string, url: string): any => ({
-  object: "block",
-  type: "paragraph",
-  paragraph: { rich_text: [{ type: "text", text: { content: label, link: { url } } }] },
-});
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-const divider = (): any => ({ object: "block", type: "divider", divider: {} });
-
 type Card = {
   person: string | null;
   workDay: string;
@@ -308,18 +290,6 @@ export async function GET(request: Request) {
     const today = londonDate(0);
     const expectedLastWorkday = previousWorkday(today);
     const isMonday = dayOfWeek(today) === 1;
-
-    // Founder roll-up target (may be absent on weekends / if not yet created).
-    const tasks = await notion.databases.query({
-      database_id: ACTIONS_DB_ID,
-      filter: {
-        and: [
-          { property: "Do date", date: { equals: today } },
-          { property: "Task", title: { equals: REVIEW_TASK_TITLE } },
-        ],
-      },
-    });
-    const taskPage = tasks.results[0] ?? null;
 
     // Pull recent scorecards (within lookback, prior to today).
     const cutoff = londonDate(-LOOKBACK_DAYS);
@@ -539,103 +509,35 @@ export async function GET(request: Request) {
       if (text) weekly = { text, range: `${prevMonday} to ${prevFriday}` };
     }
 
-    // Founder roll-up.
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const blocks: any[] = [];
-    blocks.push(h2(`Team EOD review — ${today}`));
+    // Founder digest → Slack (the only founder surface; no Notion task).
+    const slackLines: string[] = [`*Team EOD — ${today}*`];
     if (escalations.length) {
-      blocks.push(h2("⚠️ Needs your attention"));
-      for (const e of escalations) blocks.push(para(`• ${e}`));
+      slackLines.push(":rotating_light: *Needs attention*");
+      for (const e of escalations) slackLines.push(`• ${e}`);
     }
-    blocks.push(
-      para(
-        "Submitted: " +
-          results
-            .map((r) => (r.submitted ? `✅ ${r.name} (${r.lastDay})` : `⚠️ ${r.name} — none`))
-            .join("   ·   "),
-      ),
-    );
     for (const r of results) {
-      blocks.push(divider());
-      blocks.push(h2(`${r.name}${r.lastDay ? ` — ${r.lastDay}` : ""}`));
       if (!r.submitted) {
-        blocks.push(para(`⚠️ No EOD in the last ${LOOKBACK_DAYS} days. Chase them.`));
+        slackLines.push(`*${r.name}* — no EOD in the last ${LOOKBACK_DAYS} days`);
         continue;
       }
-      blocks.push(
-        para(
-          `Hours: ${r.hours || "n/a"} | Output: ${r.output ?? "n/a"} | Clean: ${r.clean ? "Yes" : "No"}`,
-        ),
+      const flag = (r.output ?? 0) === 0 ? " ⚠️" : "";
+      const reviewed = r.posted ? "" : r.alreadyCommented ? " · already reviewed" : "";
+      slackLines.push(
+        `*${r.name}* (${r.lastDay}) — output ${r.output ?? "n/a"}${flag}${reviewed}  <${r.rowUrl}|scorecard>`,
       );
-      blocks.push(
-        para(
-          `${(r.output ?? 0) > 0 ? "Output shipped ✅" : "Output 0 ⚠️"} · All clean: ${
-            r.clean ? "Yes" : "No"
-          }${r.stale ? ` · ⚠️ behind (last ${r.lastDay})` : ""}`,
-        ),
-      );
-      if (r.prevReplied != null) {
-        blocks.push(
-          para(`Replied to ${r.prevDay ?? "last"} note: ${r.prevReplied ? "Yes ✅" : "No ⚠️"}`),
-        );
-      }
-      if (r.comment) {
-        const status = r.posted
-          ? " (posted)"
-          : r.alreadyCommented
-          ? " (already posted)"
-          : dry
-          ? " (dry-run — not posted)"
-          : " (not posted)";
-        blocks.push(para(`Assistant → ${r.name}${status}:`));
-        blocks.push(para(r.comment));
-      }
-      blocks.push(link("→ Open scorecard", r.rowUrl ?? SCORECARDS_URL));
+      if (r.comment) slackLines.push(`> ${snip(r.comment, 260)}`);
     }
     if (weekly) {
-      blocks.push(divider());
-      blocks.push(h2(`Week in review — ${weekly.range}`));
-      for (const l of weekly.text.split("\n").map((s) => s.trim()).filter(Boolean)) {
-        blocks.push(para(l));
-      }
+      slackLines.push(`*Week in review* (${weekly.range})`);
+      slackLines.push(weekly.text);
     }
+    const slackText = slackLines.join("\n");
 
-    let bodyWritten = false;
-    if (!dry && taskPage) {
-      const existing = await notion.blocks.children.list({ block_id: taskPage.id, page_size: 1 });
-      if (existing.results.length === 0) {
-        await notion.blocks.children.append({ block_id: taskPage.id, children: blocks });
-        bodyWritten = true;
-      }
-    }
-
-    // Slack founder digest — once per real run (tied to new posts / body write).
+    // Send once per real run — tied to at least one new comment being posted, so
+    // manual re-runs and Vercel retries don't double-post.
     let slackSent = false;
-    const shouldSlack = !dry && (results.some((r) => r.posted) || bodyWritten);
-    if (shouldSlack) {
-      const lines: string[] = [`*Team EOD — ${today}*`];
-      if (escalations.length) {
-        lines.push(":rotating_light: *Needs attention*");
-        for (const e of escalations) lines.push(`• ${e}`);
-      }
-      for (const r of results) {
-        if (!r.submitted) {
-          lines.push(`• *${r.name}* — no EOD in ${LOOKBACK_DAYS}d`);
-          continue;
-        }
-        const zero = (r.output ?? 0) === 0 ? " ⚠️" : "";
-        const ignored = r.prevReplied === false ? ", ignored last note" : "";
-        lines.push(`• *${r.name}* (${r.lastDay}) — output ${r.output ?? "n/a"}${zero}${ignored}`);
-      }
-      if (weekly) {
-        lines.push(`*Week in review* (${weekly.range})`);
-        lines.push(weekly.text);
-      }
-      const reviewUrl = taskPage
-        ? `https://www.notion.so/${(taskPage.id as string).replace(/-/g, "")}`
-        : SCORECARDS_URL;
-      lines.push(`<${reviewUrl}|Open review task>`);
-      slackSent = await postSlack(lines.join("\n"), escalations.length > 0);
+    if (!dry && results.some((r) => r.posted)) {
+      slackSent = await postSlack(slackText, escalations.length > 0);
     }
 
     return Response.json({
@@ -644,9 +546,9 @@ export async function GET(request: Request) {
       isMonday,
       escalations,
       weekly: weekly?.range ?? null,
-      taskId: taskPage?.id ?? null,
-      bodyWritten,
+      slackConfigured: !!process.env.SLACK_WEBHOOK_URL,
       slackSent,
+      slackText,
       results,
     });
   } catch (err: unknown) {
