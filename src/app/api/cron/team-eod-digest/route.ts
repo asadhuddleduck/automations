@@ -3,33 +3,31 @@ import { notion } from "@/lib/notion";
 // Team-EOD accountability assistant.
 //
 // Replaces the claude.ai cloud routine "⚡ Daily Team EOD Review" (silenced
-// 7 Jul 2026) AND corrects the 25 May code rebuild, which wrongly wrote
-// founder-facing coaching to Asad. This version is TEAM-FACING: each weekday
-// morning it reviews yesterday's scorecards and, for each team member, posts a
-// comment ON THEIR scorecard row (@mentioning them) in Asad's assistant voice —
-// praising only substantiated wins, and calling out skipped/faked blockers and
-// zero-output days against the standard written into the scorecard's own field
-// descriptions (Hormozi EOD: the blocker is the ONE binding constraint, never
-// "none"). It also writes a compliance roll-up into Asad's "Review yesterday's
-// team EOD reports" task so he can audit what was posted.
+// 7 Jul 2026). TEAM-FACING: each weekday it reviews each member's most recent
+// UN-reviewed scorecard and posts a coaching comment ON THEIR row (@mention),
+// in Asad's assistant voice, against the standard written into the scorecard's
+// own field descriptions (Hormozi EOD: the blocker is the ONE binding
+// constraint, never "none"). It praises only substantiated wins and calls out
+// skipped/faked blockers + zero-output days, with prev-day continuity.
 //
 // Flow (GET, weekday cron 30 6 * * 1-5):
-//   1. Pull recent scorecards; pick the latest prior work-day with data.
-//   2. For each roster member: take their LATEST submission for that day, build
-//      a trend line, ask Claude for a reply addressed to them.
-//   3. Auto-post that reply as a comment on their scorecard row (idempotent:
-//      skips if our bot already commented on the row).
-//   4. Append a compliance roll-up to Asad's review task (idempotent: skips if
-//      the body already has blocks).
+//   1. Pull recent scorecards.
+//   2. Per member: take their LATEST scorecard (any day within lookback). If our
+//      bot already commented it, skip; else coach + post a comment on that row.
+//      Decoupled per person, so a miss/late/weekend row on one doesn't affect the
+//      other, and an older un-reviewed row still gets picked up.
+//   3. Write a founder roll-up (escalations first) to Asad's review task.
+//   4. Post a concise founder digest to Slack (#ai-convo-landing-page).
+//   5. On Mondays, add a prior-week review (founder-facing only).
 // ?dry=1 generates everything and returns it as JSON without posting/appending.
 
 const ACTIONS_DB_ID = "2c384fd7-bc4e-81a1-b469-e33afbf19157";
 const SCORECARDS_DB_ID = "9dfdc9d7735941088a66b4c8978a54ca";
 const SCORECARDS_URL = "https://www.notion.so/9dfdc9d7735941088a66b4c8978a54ca";
 const REVIEW_TASK_TITLE = "Review yesterday's team EOD reports";
-const LOOKBACK_DAYS = 14; // 2 weeks of history for trend context
+const LOOKBACK_DAYS = 14; // 2 weeks of history for trend + weekly context
 
-// Expected team roster. Missing member on the target day -> "No EOD submitted".
+// Expected team roster.
 const ROSTER: { id: string; name: string }[] = [
   { id: "ac601ede-0d62-4107-b59e-21c0530b5348", name: "Akmal" },
   { id: "5205445e-a97c-406f-aca0-2671a339085e", name: "Sidra Imtiaz" },
@@ -60,6 +58,24 @@ function londonDate(days = 0): string {
   }).format(d);
 }
 
+// Date-string helpers (weekday of a calendar date is TZ-independent at UTC midnight).
+function isoAddDays(iso: string, n: number): string {
+  const d = new Date(iso + "T00:00:00Z");
+  d.setUTCDate(d.getUTCDate() + n);
+  return d.toISOString().slice(0, 10);
+}
+function dayOfWeek(iso: string): number {
+  return new Date(iso + "T00:00:00Z").getUTCDay(); // 0 = Sun, 6 = Sat
+}
+function previousWorkday(iso: string): string {
+  let d = isoAddDays(iso, -1);
+  while (dayOfWeek(d) === 0 || dayOfWeek(d) === 6) d = isoAddDays(d, -1);
+  return d;
+}
+function scorecardRowUrl(id: string): string {
+  return `https://www.notion.so/${id.replace(/-/g, "")}`;
+}
+
 // The work-day a scorecard reports for lives in its title as a leading ISO
 // datetime; fall back to created_time if the title isn't parseable.
 function scorecardWorkDay(page: AnyProps): string {
@@ -69,8 +85,6 @@ function scorecardWorkDay(page: AnyProps): string {
   return (page.created_time as string).slice(0, 10);
 }
 
-// Assistant reply addressed to the team member. Returns null on any failure so
-// the caller degrades gracefully (roll-up still writes, no comment posted).
 type PrevContext = {
   day: string;
   output: number | null;
@@ -80,6 +94,8 @@ type PrevContext = {
   replyText: string;
 };
 
+// Assistant reply addressed to the team member. Returns null on any failure so
+// the caller degrades gracefully (roll-up still writes, no comment posted).
 async function assistantComment(input: {
   name: string;
   hours: string;
@@ -142,6 +158,39 @@ Write a 2-4 sentence reply to ${input.name}:
 
 Return ONLY the reply text: no preamble, no reasoning, no quotes, no headers.`;
 
+  return callClaude(prompt, 400);
+}
+
+// Prior-week readout for Asad (founder-facing only, not sent to the team).
+async function weeklyReview(
+  people: {
+    name: string;
+    days: { day: string; output: number | null; winBlocker: string }[];
+    outputSum: number;
+    submitted: number;
+    zeroDays: number;
+  }[],
+): Promise<string | null> {
+  const key = process.env.ANTHROPIC_API_KEY;
+  if (!key) return null;
+  const body = people
+    .map((p) => {
+      const lines = p.days
+        .map((d) => `  ${d.day}: output ${d.output ?? "n/a"} - ${d.winBlocker || "(blank)"}`)
+        .join("\n");
+      return `${p.name}: submitted ${p.submitted}/5, total output ${p.outputSum}, zero-output days ${p.zeroDays}\n${lines}`;
+    })
+    .join("\n\n");
+  const prompt = `You are Asad's assistant. Below is last week's EOD data for his team. Write a SHORT week-in-review for ASAD (founder-facing, not for the team). For each person give at most 2 lines: what they actually shipped this week, and whether they named and made progress on a real blocker or kept dodging it. Be honest and specific. Flag anyone who logged hours but shipped little. Plain language, no em dashes, no hype words. Use only the numbers given. Start each person on a new line with their name. Return only the readout.
+
+${body}`;
+  return callClaude(prompt, 500);
+}
+
+// Shared raw call to the Anthropic API (opus, no thinking, text-only out).
+async function callClaude(prompt: string, maxTokens: number): Promise<string | null> {
+  const key = process.env.ANTHROPIC_API_KEY;
+  if (!key) return null;
   try {
     const res = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
@@ -152,7 +201,7 @@ Return ONLY the reply text: no preamble, no reasoning, no quotes, no headers.`;
       },
       body: JSON.stringify({
         model: "claude-opus-4-8",
-        max_tokens: 400,
+        max_tokens: maxTokens,
         messages: [{ role: "user", content: prompt }],
       }),
     });
@@ -161,7 +210,6 @@ Return ONLY the reply text: no preamble, no reasoning, no quotes, no headers.`;
       return null;
     }
     const data = await res.json();
-    // Join text blocks (robust even if a thinking block ever appears first).
     const text: string = Array.isArray(data?.content)
       ? data.content
           .filter((b: AnyProps) => b.type === "text")
@@ -173,6 +221,30 @@ Return ONLY the reply text: no preamble, no reasoning, no quotes, no headers.`;
   } catch (err) {
     console.error("[team-eod-digest] Claude fetch failed:", err);
     return null;
+  }
+}
+
+// Founder digest to Slack. Env-gated + swallow-all so it can NEVER crash the cron.
+async function postSlack(text: string, alert: boolean): Promise<boolean> {
+  const url = process.env.SLACK_WEBHOOK_URL;
+  if (!url) return false;
+  try {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        attachments: [
+          {
+            color: alert ? "#FF4444" : "#1EBA8F",
+            blocks: [{ type: "section", text: { type: "mrkdwn", text } }],
+          },
+        ],
+      }),
+    });
+    return res.ok;
+  } catch (err) {
+    console.error("[team-eod-digest] slack post failed:", err);
+    return false;
   }
 }
 
@@ -209,15 +281,19 @@ type Card = {
 type MemberResult = {
   name: string;
   submitted: boolean;
+  lastDay?: string | null;
+  stale?: boolean; // latest scorecard is older than the expected last work-day
   hours?: string;
   output?: number | null;
   clean?: boolean;
   winBlocker?: string;
+  recentOutputs?: (number | null)[];
   comment?: string | null;
   posted?: boolean;
   alreadyCommented?: boolean;
   prevDay?: string | null;
   prevReplied?: boolean | null; // null = no prior note of ours to reply to
+  rowUrl?: string;
 };
 
 export async function GET(request: Request) {
@@ -230,6 +306,8 @@ export async function GET(request: Request) {
 
   try {
     const today = londonDate(0);
+    const expectedLastWorkday = previousWorkday(today);
+    const isMonday = dayOfWeek(today) === 1;
 
     // Founder roll-up target (may be absent on weekends / if not yet created).
     const tasks = await notion.databases.query({
@@ -243,7 +321,7 @@ export async function GET(request: Request) {
     });
     const taskPage = tasks.results[0] ?? null;
 
-    // 1. Pull recent scorecards, pick the latest prior work-day with data.
+    // Pull recent scorecards (within lookback, prior to today).
     const cutoff = londonDate(-LOOKBACK_DAYS);
     const scorecards = await notion.databases.query({
       database_id: SCORECARDS_DB_ID,
@@ -263,11 +341,6 @@ export async function GET(request: Request) {
       })
       .filter((c) => c.workDay < today && c.workDay >= cutoff);
 
-    if (cards.length === 0) {
-      return Response.json({ skipped: "no scorecards in lookback window", today, cutoff });
-    }
-    const targetDay = cards.map((c) => c.workDay).sort().reverse()[0];
-
     // Our integration's bot user id — used for comment idempotency.
     let botId: string | null = null;
     try {
@@ -276,39 +349,44 @@ export async function GET(request: Request) {
       console.error("[team-eod-digest] users.me failed:", err);
     }
 
-    // 2. + 3. Per member: pick latest submission, coach, post comment.
+    // Per member: pick their most recent scorecard, coach, post comment.
     const results: MemberResult[] = [];
     for (const member of ROSTER) {
-      // Latest submission for the target day (fixes duplicate same-day rows).
-      const card =
-        cards
-          .filter((c) => c.person === member.id && c.workDay === targetDay)
-          .sort((a, b) => (a.createdTime < b.createdTime ? 1 : -1))[0] ?? null;
+      const theirCards = cards
+        .filter((c) => c.person === member.id)
+        .sort((a, b) =>
+          a.workDay !== b.workDay
+            ? a.workDay < b.workDay
+              ? 1
+              : -1
+            : a.createdTime < b.createdTime
+            ? 1
+            : -1,
+        );
+      const card = theirCards[0] ?? null;
 
       if (!card) {
-        results.push({ name: member.name, submitted: false });
+        results.push({ name: member.name, submitted: false, lastDay: null, stale: true });
         continue;
       }
 
+      const day = card.workDay;
       const hours = richText(card.props.Hours);
       const output = card.props.Output?.number ?? null;
       const clean = card.props["All clean?"]?.checkbox ?? false;
       const winBlocker = richText(card.props["Win + blocker"]);
 
-      // Trend: last 5 prior work-days for this member (latest row per day).
+      // Trend + prev: their prior work-days (latest row per day), before `day`.
       const byDay = new Map<string, Card>();
-      for (const c of cards) {
-        if (c.person !== member.id || c.workDay >= targetDay) continue;
+      for (const c of theirCards) {
+        if (c.workDay >= day) continue;
         const cur = byDay.get(c.workDay);
         if (!cur || c.createdTime > cur.createdTime) byDay.set(c.workDay, c);
       }
       const priorDaysDesc = [...byDay.entries()].sort((a, b) => (a[0] < b[0] ? 1 : -1));
-      const recentOutputs = priorDaysDesc
-        .slice(0, 5)
-        .map(([, c]) => c.props.Output?.number ?? null);
+      const recentOutputs = priorDaysDesc.slice(0, 5).map(([, c]) => c.props.Output?.number ?? null);
 
-      // Previous scorecard (their most recent prior submission) + did they reply
-      // to the note we left on it? Gives the daily nudge continuity/memory.
+      // Previous scorecard + did they reply to the note we left on it?
       let prev: PrevContext | null = null;
       const prevEntry = priorDaysDesc[0] ?? null;
       if (prevEntry) {
@@ -319,7 +397,7 @@ export async function GET(request: Request) {
         try {
           const cs = await notion.comments.list({ block_id: prevCard.id });
           const sorted = [...cs.results].sort((a, b) =>
-            ((a.created_time as string) < (b.created_time as string) ? -1 : 1),
+            (a.created_time as string) < (b.created_time as string) ? -1 : 1,
           );
           const lastBot = [...sorted]
             .reverse()
@@ -398,35 +476,90 @@ export async function GET(request: Request) {
       results.push({
         name: member.name,
         submitted: true,
+        lastDay: day,
+        stale: day < expectedLastWorkday,
         hours,
         output,
         clean,
         winBlocker,
+        recentOutputs,
         comment,
         posted,
         alreadyCommented,
         prevDay: prev?.day ?? null,
         prevReplied: prev?.botCommented ? prev.replied : null,
+        rowUrl: scorecardRowUrl(card.id),
       });
     }
 
-    // 4. Founder roll-up (compliance scan + audit of what was posted).
+    // Escalations (objective chronic-pattern flags for Asad).
+    const escalations: string[] = [];
+    for (const r of results) {
+      if (!r.submitted) {
+        escalations.push(`${r.name} has no EOD in the last ${LOOKBACK_DAYS} days.`);
+        continue;
+      }
+      if (r.stale) escalations.push(`${r.name} hasn't submitted since ${r.lastDay}.`);
+      const recentZeros = (r.recentOutputs ?? []).filter((o) => (o ?? 0) === 0).length;
+      const zeros = ((r.output ?? 0) === 0 ? 1 : 0) + recentZeros;
+      const windowN = 1 + (r.recentOutputs?.length ?? 0);
+      if ((r.output ?? null) === 0 && zeros >= 3) {
+        escalations.push(`${r.name}: ${zeros} zero-output days in the last ${windowN}.`);
+      }
+    }
+
+    // Weekly review (Mondays only, founder-facing).
+    let weekly: { text: string; range: string } | null = null;
+    if (isMonday) {
+      const prevFriday = expectedLastWorkday; // on Monday = last Friday
+      const prevMonday = isoAddDays(prevFriday, -4);
+      const people = ROSTER.map((m) => {
+        const daysMap = new Map<string, Card>();
+        for (const c of cards) {
+          if (c.person !== m.id || c.workDay < prevMonday || c.workDay > prevFriday) continue;
+          const cur = daysMap.get(c.workDay);
+          if (!cur || c.createdTime > cur.createdTime) daysMap.set(c.workDay, c);
+        }
+        const days = [...daysMap.entries()]
+          .sort((a, b) => (a[0] < b[0] ? -1 : 1))
+          .map(([d, c]) => ({
+            day: d,
+            output: c.props.Output?.number ?? null,
+            winBlocker: richText(c.props["Win + blocker"]),
+          }));
+        return {
+          name: m.name,
+          days,
+          outputSum: days.reduce((s, d) => s + (d.output ?? 0), 0),
+          submitted: days.length,
+          zeroDays: days.filter((d) => (d.output ?? 0) === 0).length,
+        };
+      });
+      const text = await weeklyReview(people);
+      if (text) weekly = { text, range: `${prevMonday} to ${prevFriday}` };
+    }
+
+    // Founder roll-up.
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const blocks: any[] = [];
-    blocks.push(h2(`Team EOD — ${targetDay}`));
+    blocks.push(h2(`Team EOD review — ${today}`));
+    if (escalations.length) {
+      blocks.push(h2("⚠️ Needs your attention"));
+      for (const e of escalations) blocks.push(para(`• ${e}`));
+    }
     blocks.push(
       para(
         "Submitted: " +
           results
-            .map((r) => (r.submitted ? `✅ ${r.name}` : `⚠️ ${r.name} — NO REPORT`))
+            .map((r) => (r.submitted ? `✅ ${r.name} (${r.lastDay})` : `⚠️ ${r.name} — none`))
             .join("   ·   "),
       ),
     );
     for (const r of results) {
       blocks.push(divider());
-      blocks.push(h2(r.name));
+      blocks.push(h2(`${r.name}${r.lastDay ? ` — ${r.lastDay}` : ""}`));
       if (!r.submitted) {
-        blocks.push(para(`⚠️ No EOD submitted for ${targetDay}. Chase them.`));
+        blocks.push(para(`⚠️ No EOD in the last ${LOOKBACK_DAYS} days. Chase them.`));
         continue;
       }
       blocks.push(
@@ -438,7 +571,7 @@ export async function GET(request: Request) {
         para(
           `${(r.output ?? 0) > 0 ? "Output shipped ✅" : "Output 0 ⚠️"} · All clean: ${
             r.clean ? "Yes" : "No"
-          }`,
+          }${r.stale ? ` · ⚠️ behind (last ${r.lastDay})` : ""}`,
         ),
       );
       if (r.prevReplied != null) {
@@ -457,7 +590,14 @@ export async function GET(request: Request) {
         blocks.push(para(`Assistant → ${r.name}${status}:`));
         blocks.push(para(r.comment));
       }
-      blocks.push(link("→ Open scorecard", SCORECARDS_URL));
+      blocks.push(link("→ Open scorecard", r.rowUrl ?? SCORECARDS_URL));
+    }
+    if (weekly) {
+      blocks.push(divider());
+      blocks.push(h2(`Week in review — ${weekly.range}`));
+      for (const l of weekly.text.split("\n").map((s) => s.trim()).filter(Boolean)) {
+        blocks.push(para(l));
+      }
     }
 
     let bodyWritten = false;
@@ -469,11 +609,44 @@ export async function GET(request: Request) {
       }
     }
 
+    // Slack founder digest — once per real run (tied to new posts / body write).
+    let slackSent = false;
+    const shouldSlack = !dry && (results.some((r) => r.posted) || bodyWritten);
+    if (shouldSlack) {
+      const lines: string[] = [`*Team EOD — ${today}*`];
+      if (escalations.length) {
+        lines.push(":rotating_light: *Needs attention*");
+        for (const e of escalations) lines.push(`• ${e}`);
+      }
+      for (const r of results) {
+        if (!r.submitted) {
+          lines.push(`• *${r.name}* — no EOD in ${LOOKBACK_DAYS}d`);
+          continue;
+        }
+        const zero = (r.output ?? 0) === 0 ? " ⚠️" : "";
+        const ignored = r.prevReplied === false ? ", ignored last note" : "";
+        lines.push(`• *${r.name}* (${r.lastDay}) — output ${r.output ?? "n/a"}${zero}${ignored}`);
+      }
+      if (weekly) {
+        lines.push(`*Week in review* (${weekly.range})`);
+        lines.push(weekly.text);
+      }
+      const reviewUrl = taskPage
+        ? `https://www.notion.so/${(taskPage.id as string).replace(/-/g, "")}`
+        : SCORECARDS_URL;
+      lines.push(`<${reviewUrl}|Open review task>`);
+      slackSent = await postSlack(lines.join("\n"), escalations.length > 0);
+    }
+
     return Response.json({
       dry,
-      targetDay,
+      today,
+      isMonday,
+      escalations,
+      weekly: weekly?.range ?? null,
       taskId: taskPage?.id ?? null,
       bodyWritten,
+      slackSent,
       results,
     });
   } catch (err: unknown) {
