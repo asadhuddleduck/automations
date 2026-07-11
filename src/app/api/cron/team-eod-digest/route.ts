@@ -1,4 +1,5 @@
 import { notion } from "@/lib/notion";
+import { notify } from "@/lib/notify";
 
 // Team-EOD accountability assistant.
 //
@@ -10,10 +11,11 @@ import { notion } from "@/lib/notion";
 // constraint, never "none"). It praises only substantiated wins and calls out
 // skipped/faked blockers + zero-output days, with prev-day continuity.
 //
-// The founder surface is SLACK (#ai-convo-landing-page) — a concise daily digest
-// with escalations, per-person status, scorecard links, and (Mondays) a
-// prior-week review. There is NO daily Notion task (the recurring review task was
-// retired 9 Jul 2026 — it cluttered Asad's Actions).
+// The founder surface is SLACK. The digest goes through notify() at severity
+// "human" (Asad has to read the team's scorecards and reply), so it routes to
+// #alerts. It carries escalations, per-person status, scorecard links, and
+// (Mondays) a prior-week review. There is NO daily Notion task (the recurring
+// review task was retired 9 Jul 2026, it cluttered Asad's Actions).
 //
 // Flow (GET, weekday cron 30 6 * * 1-5):
 //   1. Pull recent scorecards.
@@ -21,9 +23,17 @@ import { notion } from "@/lib/notion";
 //      already commented it, skip; else coach + post a comment on that row.
 //      Decoupled per person, so a miss/late/weekend row on one doesn't affect the
 //      other, and an older un-reviewed row still gets picked up.
-//   3. Post a founder digest to Slack (once per real run, when new comments post).
+//   3. Post a founder digest to Slack (once per real run, when new comments post
+//      or when there is an escalation).
 // ?dry=1 generates everything and returns it as JSON (incl. the Slack preview)
 // without posting anything.
+//
+// Dead-man's switch (severity "broken", the loud lane):
+//   - The route crashes -> Slack, because a Vercel cron 500 is silent and the team would
+//     go unreviewed forever with nobody knowing.
+//   - The coaching call fails for half or more of the team -> Slack, because every failed
+//     call used to render as the harmless string "no note", which made a total Anthropic
+//     outage look exactly like a calm day. It must never be ambiguous.
 
 const SCORECARDS_DB_ID = "9dfdc9d7735941088a66b4c8978a54ca";
 const LOOKBACK_DAYS = 14; // 2 weeks of history for trend + weekly context
@@ -98,20 +108,26 @@ type PrevContext = {
   replyText: string;
 };
 
-// Assistant reply addressed to the team member. Returns null on any failure so
-// the caller degrades gracefully (no comment posted).
-async function assistantComment(input: {
-  name: string;
-  hours: string;
-  output: number | null;
-  clean: boolean;
-  winBlocker: string;
-  recentOutputs: (number | null)[]; // prior work-days, newest first, excl. today
-  prev: PrevContext | null; // their previous scorecard + whether they replied
-}): Promise<string | null> {
-  const key = process.env.ANTHROPIC_API_KEY;
-  if (!key) return null;
+// A dead Anthropic API used to be invisible: every call returned null, every person
+// rendered as the innocuous "no note", and a total outage read exactly like a calm day.
+// Every call is now counted here so the caller can tell "nobody needed coaching" apart
+// from "coaching could not be written for anybody".
+type AiHealth = { attempts: number; failures: number; lastError: string | null };
 
+// Assistant reply addressed to the team member. Returns null on any failure so
+// the caller degrades gracefully (no comment posted) and records it in `health`.
+async function assistantComment(
+  input: {
+    name: string;
+    hours: string;
+    output: number | null;
+    clean: boolean;
+    winBlocker: string;
+    recentOutputs: (number | null)[]; // prior work-days, newest first, excl. today
+    prev: PrevContext | null; // their previous scorecard + whether they replied
+  },
+  health: AiHealth,
+): Promise<string | null> {
   const zeroDays = input.recentOutputs.filter((o) => (o ?? 0) === 0).length;
   const trend = input.recentOutputs.length
     ? `Recent output before today (newest first): [${input.recentOutputs
@@ -162,7 +178,7 @@ Write a 2-4 sentence reply to ${input.name}:
 
 Return ONLY the reply text: no preamble, no reasoning, no quotes, no headers.`;
 
-  return callClaude(prompt, 400);
+  return callClaude(prompt, 400, health);
 }
 
 // Prior-week readout for Asad (founder-facing only, not sent to the team).
@@ -174,9 +190,8 @@ async function weeklyReview(
     submitted: number;
     zeroDays: number;
   }[],
+  health: AiHealth,
 ): Promise<string | null> {
-  const key = process.env.ANTHROPIC_API_KEY;
-  if (!key) return null;
   const body = people
     .map((p) => {
       const lines = p.days
@@ -188,13 +203,25 @@ async function weeklyReview(
   const prompt = `You are Asad's assistant. Below is last week's EOD data for his team. Write a SHORT week-in-review for ASAD (founder-facing, not for the team). For each person give at most 2 lines: what they actually shipped this week, and whether they named and made progress on a real blocker or kept dodging it. Be honest and specific. Flag anyone who logged hours but shipped little. Plain language, no em dashes, no hype words. Use only the numbers given. Start each person on a new line with their name. Return only the readout.
 
 ${body}`;
-  return callClaude(prompt, 500);
+  return callClaude(prompt, 500, health);
 }
 
-// Shared raw call to the Anthropic API (opus, no thinking, text-only out).
-async function callClaude(prompt: string, maxTokens: number): Promise<string | null> {
+// Shared raw call to the Anthropic API (opus, no thinking, text-only out). Every exit
+// path that produces no text is a FAILURE and is recorded, including a missing API key
+// and an empty completion. Callers still get null and degrade gracefully.
+async function callClaude(
+  prompt: string,
+  maxTokens: number,
+  health: AiHealth,
+): Promise<string | null> {
+  health.attempts++;
   const key = process.env.ANTHROPIC_API_KEY;
-  if (!key) return null;
+  if (!key) {
+    health.failures++;
+    health.lastError = "ANTHROPIC_API_KEY is not set";
+    console.error("[team-eod-digest] ANTHROPIC_API_KEY is not set");
+    return null;
+  }
   try {
     const res = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
@@ -210,7 +237,10 @@ async function callClaude(prompt: string, maxTokens: number): Promise<string | n
       }),
     });
     if (!res.ok) {
-      console.error("[team-eod-digest] Claude error:", res.status, await res.text());
+      const body = await res.text();
+      console.error("[team-eod-digest] Claude error:", res.status, body);
+      health.failures++;
+      health.lastError = `Anthropic returned HTTP ${res.status}: ${snip(body, 160)}`;
       return null;
     }
     const data = await res.json();
@@ -221,34 +251,19 @@ async function callClaude(prompt: string, maxTokens: number): Promise<string | n
           .join("")
           .trim()
       : "";
-    return text || null;
+    if (!text) {
+      health.failures++;
+      health.lastError = "Anthropic returned an empty completion";
+      console.error("[team-eod-digest] Claude returned an empty completion");
+      return null;
+    }
+    return text;
   } catch (err) {
-    console.error("[team-eod-digest] Claude fetch failed:", err);
+    const message = err instanceof Error ? err.message : String(err);
+    console.error("[team-eod-digest] Claude fetch failed:", message);
+    health.failures++;
+    health.lastError = message;
     return null;
-  }
-}
-
-// Founder digest to Slack. Env-gated + swallow-all so it can NEVER crash the cron.
-async function postSlack(text: string, alert: boolean): Promise<boolean> {
-  const url = process.env.SLACK_WEBHOOK_URL;
-  if (!url) return false;
-  try {
-    const res = await fetch(url, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        attachments: [
-          {
-            color: alert ? "#FF4444" : "#1EBA8F",
-            blocks: [{ type: "section", text: { type: "mrkdwn", text } }],
-          },
-        ],
-      }),
-    });
-    return res.ok;
-  } catch (err) {
-    console.error("[team-eod-digest] slack post failed:", err);
-    return false;
   }
 }
 
@@ -273,6 +288,7 @@ type MemberResult = {
   comment?: string | null;
   posted?: boolean;
   alreadyCommented?: boolean;
+  coachFailed?: boolean; // we tried to generate a note for them and the AI gave us nothing
   prevDay?: string | null;
   prevReplied?: boolean | null; // null = no prior note of ours to reply to
   rowUrl?: string;
@@ -320,6 +336,8 @@ export async function GET(request: Request) {
     }
 
     // Per member: pick their most recent scorecard, coach, post comment.
+    const coachHealth: AiHealth = { attempts: 0, failures: 0, lastError: null };
+    const weeklyHealth: AiHealth = { attempts: 0, failures: 0, lastError: null };
     const results: MemberResult[] = [];
     for (const member of ROSTER) {
       const theirCards = cards
@@ -404,17 +422,9 @@ export async function GET(request: Request) {
         };
       }
 
-      const comment = await assistantComment({
-        name: member.name,
-        hours,
-        output,
-        clean,
-        winBlocker,
-        recentOutputs,
-        prev,
-      });
-
-      // Idempotency: has our bot already commented on this row?
+      // Idempotency: has our bot already commented on this row? Checked BEFORE the AI
+      // call so an already-reviewed row costs nothing and cannot skew the AI-health math
+      // (a failure there is not a person who lost their coaching note).
       let alreadyCommented = false;
       try {
         const existing = await notion.comments.list({ block_id: card.id });
@@ -424,6 +434,19 @@ export async function GET(request: Request) {
       } catch (err) {
         console.error("[team-eod-digest] comments.list failed:", err);
       }
+
+      // In a real run there is nothing to write on a reviewed row. ?dry=1 still generates
+      // the note: previewing it is the whole point of a dry run.
+      const needsCoaching = !alreadyCommented || dry;
+      const comment = needsCoaching
+        ? await assistantComment(
+            { name: member.name, hours, output, clean, winBlocker, recentOutputs, prev },
+            coachHealth,
+          )
+        : null;
+      // assistantComment makes exactly one Claude call, and callClaude returns null only
+      // when that call produced no text, so null here means the AI failed this person.
+      const coachFailed = needsCoaching && comment === null;
 
       let posted = false;
       if (comment && !dry && !alreadyCommented) {
@@ -456,25 +479,35 @@ export async function GET(request: Request) {
         comment,
         posted,
         alreadyCommented,
+        coachFailed,
         prevDay: prev?.day ?? null,
         prevReplied: prev?.botCommented ? prev.replied : null,
         rowUrl: scorecardRowUrl(card.id),
       });
     }
 
-    // Escalations (objective chronic-pattern flags for Asad).
-    const escalations: string[] = [];
+    // Escalations (objective chronic-pattern flags for Asad). Carry the person's
+    // name so the Slack headline can say WHO, never just a count.
+    const escalations: { name: string; text: string }[] = [];
     for (const r of results) {
       if (!r.submitted) {
-        escalations.push(`${r.name} has no EOD in the last ${LOOKBACK_DAYS} days.`);
+        escalations.push({
+          name: r.name,
+          text: `${r.name} has no EOD in the last ${LOOKBACK_DAYS} days.`,
+        });
         continue;
       }
-      if (r.stale) escalations.push(`${r.name} hasn't submitted since ${r.lastDay}.`);
+      if (r.stale) {
+        escalations.push({ name: r.name, text: `${r.name} hasn't submitted since ${r.lastDay}.` });
+      }
       const recentZeros = (r.recentOutputs ?? []).filter((o) => (o ?? 0) === 0).length;
       const zeros = ((r.output ?? 0) === 0 ? 1 : 0) + recentZeros;
       const windowN = 1 + (r.recentOutputs?.length ?? 0);
       if ((r.output ?? null) === 0 && zeros >= 3) {
-        escalations.push(`${r.name}: ${zeros} zero-output days in the last ${windowN}.`);
+        escalations.push({
+          name: r.name,
+          text: `${r.name}: ${zeros} zero-output days in the last ${windowN}.`,
+        });
       }
     }
 
@@ -505,55 +538,158 @@ export async function GET(request: Request) {
           zeroDays: days.filter((d) => (d.output ?? 0) === 0).length,
         };
       });
-      const text = await weeklyReview(people);
+      const text = await weeklyReview(people, weeklyHealth);
       if (text) weekly = { text, range: `${prevMonday} to ${prevFriday}` };
     }
 
-    // Founder digest → Slack (the only founder surface; no Notion task).
-    const slackLines: string[] = [`*Team EOD — ${today}*`];
-    if (escalations.length) {
-      slackLines.push(":rotating_light: *Needs attention*");
-      for (const e of escalations) slackLines.push(`• ${e}`);
+    // Founder digest → Slack #alerts via notify() at severity "human": a person is
+    // waiting on Asad (Akmal and Sidra's scorecards need his reply). Never a receipt.
+    const flagged = [...new Set(escalations.map((e) => e.name))];
+
+    // Headline names the people and the outcome, so no two days read the same.
+    let headline: string;
+    if (escalations.length === 1) {
+      headline = escalations[0].text.replace(/\.$/, "");
+    } else if (escalations.length > 1) {
+      headline = `${flagged.join(" and ")} ${
+        flagged.length === 1 ? "needs" : "need"
+      } chasing on EOD (${escalations.length} flags)`;
+    } else {
+      headline = `${results
+        .map((r) => `${r.name} (output ${r.output ?? "n/a"})`)
+        .join(", ")} filed EOD scorecards, coaching notes posted`;
+    }
+
+    // notify() escapes < and > in details (anti-spoof), so scorecard links go in as
+    // BARE urls. Slack still auto-links them; the <url|label> form would be mangled.
+    const details: (string | null)[] = [];
+    // With exactly one escalation the headline IS that sentence, so a bullet block here
+    // would print it twice. Only worth a "Needs attention" list when there are several.
+    if (escalations.length > 1) {
+      details.push("*Needs attention*");
+      for (const e of escalations) details.push(`• ${e.text}`);
     }
     for (const r of results) {
       if (!r.submitted) {
-        slackLines.push(`*${r.name}* — no EOD in the last ${LOOKBACK_DAYS} days`);
+        details.push(`*${r.name}*: no EOD in the last ${LOOKBACK_DAYS} days.`);
         continue;
       }
-      const flag = (r.output ?? 0) === 0 ? " ⚠️" : "";
-      const reviewed = r.posted ? "" : r.alreadyCommented ? " · already reviewed" : "";
-      slackLines.push(
-        `*${r.name}* (${r.lastDay}) — output ${r.output ?? "n/a"}${flag}${reviewed}  <${r.rowUrl}|scorecard>`,
+      const zero = (r.output ?? 0) === 0 ? " (nothing shipped)" : "";
+      // "no note" is only innocent when nothing went wrong. A failed AI call says so,
+      // otherwise an outage renders identically to a calm day.
+      const state = r.posted
+        ? "note posted"
+        : r.alreadyCommented
+        ? "already reviewed"
+        : r.coachFailed
+        ? "NO NOTE, the coaching call failed"
+        : "no note";
+      details.push(
+        `*${r.name}* (${r.lastDay}). Output ${r.output ?? "n/a"}${zero}. ${state}. ${r.rowUrl}`,
       );
-      if (r.comment) slackLines.push(`> ${snip(r.comment, 260)}`);
+      // Curly quotes, not a "> " blockquote: notify() escapes > into &gt;.
+      if (r.comment) details.push(`“${snip(r.comment, 260)}”`);
     }
     if (weekly) {
-      slackLines.push(`*Week in review* (${weekly.range})`);
-      slackLines.push(weekly.text);
+      details.push(`*Week in review* (${weekly.range})`);
+      details.push(weekly.text);
+    } else if (isMonday && weeklyHealth.failures > 0) {
+      // Say it is missing. A silently absent section reads like there was nothing to say.
+      details.push("*Week in review* is missing, the call that writes it failed.");
     }
-    const slackText = slackLines.join("\n");
 
-    // Send once per real run — tied to at least one new comment being posted, so
-    // manual re-runs and Vercel retries don't double-post.
-    let slackSent = false;
-    if (!dry && results.some((r) => r.posted)) {
-      slackSent = await postSlack(slackText, escalations.length > 0);
+    const action = escalations.length
+      ? `Chase ${flagged.join(" and ")}, then reply on the scorecard row in Notion.`
+      : "Read the notes and reply on their scorecard rows if you want to add anything.";
+    // notify() validates this as a plain https URL and renders the label itself.
+    const link = `https://www.notion.so/${SCORECARDS_DB_ID}`;
+    const linkLabel = "Scorecards database";
+
+    // Preview of the body notify() renders, kept for ?dry=1 consumers.
+    const slackText = [
+      `\u{1F64B} [Team] *${headline}*`,
+      ...details.filter(Boolean),
+      `→ ${action}`,
+      `<${link}|${linkLabel}>`,
+    ].join("\n");
+
+    // The AI going down used to be silent: every catch returned null, every person read
+    // as "no note", and the digest looked like a quiet day. Half or more of the team
+    // losing their note is a BROKEN-lane event. Half, not a strict majority: the roster
+    // is two people, so "majority" would mean "both" and let a one-of-two blackout pass.
+    const coachFailedNames = results.filter((r) => r.coachFailed).map((r) => r.name);
+    const aiDown =
+      coachHealth.attempts > 0 && coachHealth.failures * 2 >= coachHealth.attempts;
+
+    let brokenAttempted = false;
+    if (!dry && aiDown) {
+      const who = coachFailedNames.join(" and ");
+      await notify({
+        severity: "broken",
+        headline: `${who} got no EOD coaching note, the Anthropic API is failing`,
+        details: [
+          `The coaching call failed on ${coachHealth.failures} of ${coachHealth.attempts} scorecards, so nothing was written on their rows in Notion.`,
+          coachHealth.lastError ? `Last error: ${snip(coachHealth.lastError, 240)}` : null,
+          "This is not a quiet day. Their scorecards are sitting unreviewed and every run will keep failing until the API works.",
+        ],
+        action:
+          "Check status.anthropic.com and ANTHROPIC_API_KEY in Vercel, then re-run the digest.",
+        link,
+        linkLabel,
+      });
+      brokenAttempted = true;
+    }
+
+    // Send once per real run. Gating purely on `posted` used to swallow the digest
+    // on exactly the worst days: an absent teammate gets no comment, so a "no EOD in
+    // 14 days" escalation would post nowhere. Escalations now send on their own.
+    let slackAttempted = false;
+    if (!dry && (results.some((r) => r.posted) || escalations.length > 0)) {
+      await notify({ severity: "human", headline, details, action, link, linkLabel });
+      slackAttempted = true;
     }
 
     return Response.json({
       dry,
       today,
       isMonday,
-      escalations,
+      escalations: escalations.map((e) => e.text),
       weekly: weekly?.range ?? null,
-      slackConfigured: !!process.env.SLACK_WEBHOOK_URL,
-      slackSent,
+      slackConfigured: !!(
+        process.env.SLACK_ALERT_WEBHOOK_URL || process.env.SLACK_WEBHOOK_URL
+      ),
+      slackAttempted,
       slackText,
+      aiDown,
+      brokenAttempted,
+      coaching: { ...coachHealth, failedFor: coachFailedNames },
+      weeklyAi: weeklyHealth,
       results,
     });
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : String(err);
     console.error("[team-eod-digest] Error:", message);
+    // A Vercel cron 500 is silent. Without this, the digest can die on a Notion outage, a
+    // revoked NOTION_TOKEN or an Anthropic failure and nobody ever finds out: no comment
+    // lands in Notion, no Slack message goes anywhere, and the team stays unreviewed every
+    // weekday from here on. The broken lane exists for exactly this.
+    if (!dry) {
+      await notify({
+        severity: "broken",
+        headline: `The team EOD digest is dead, ${ROSTER.map((m) => m.name).join(
+          " and ",
+        )} are going unreviewed`,
+        details: [
+          "The cron threw before it could finish, so no coaching comment was posted in Notion and no digest was sent.",
+          `Error: ${snip(message, 300)}`,
+          "It will fail the same way every weekday until someone fixes it.",
+        ],
+        action:
+          "Read the Vercel logs for /api/cron/team-eod-digest, fix the cause, then re-run it.",
+        link: `https://www.notion.so/${SCORECARDS_DB_ID}`,
+        linkLabel: "Scorecards database",
+      });
+    }
     return Response.json({ error: message }, { status: 500 });
   }
 }
