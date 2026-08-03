@@ -493,7 +493,7 @@ export async function GET(request: Request) {
       if (!r.submitted) {
         escalations.push({
           name: r.name,
-          text: `${r.name} has no EOD in the last ${LOOKBACK_DAYS} days.`,
+          text: `${r.name} has not filed an end of day in the last ${LOOKBACK_DAYS} days.`,
         });
         continue;
       }
@@ -506,7 +506,7 @@ export async function GET(request: Request) {
       if ((r.output ?? null) === 0 && zeros >= 3) {
         escalations.push({
           name: r.name,
-          text: `${r.name}: ${zeros} zero-output days in the last ${windowN}.`,
+          text: `${r.name} has shipped nothing on ${zeros} of the last ${windowN} days.`,
         });
       }
     }
@@ -553,11 +553,11 @@ export async function GET(request: Request) {
     } else if (escalations.length > 1) {
       headline = `${flagged.join(" and ")} ${
         flagged.length === 1 ? "needs" : "need"
-      } chasing on EOD (${escalations.length} flags)`;
+      } chasing on their end of day (${escalations.length} things flagged)`;
     } else {
       headline = `${results
         .map((r) => `${r.name} (output ${r.output ?? "n/a"})`)
-        .join(", ")} filed EOD scorecards, coaching notes posted`;
+        .join(", ")} filed their end of day, feedback is written on their rows`;
     }
 
     // notify() escapes < and > in details (anti-spoof), so scorecard links go in as
@@ -571,19 +571,21 @@ export async function GET(request: Request) {
     }
     for (const r of results) {
       if (!r.submitted) {
-        details.push(`*${r.name}*: no EOD in the last ${LOOKBACK_DAYS} days.`);
+        details.push(
+          `*${r.name}*: has not filed an end of day in the last ${LOOKBACK_DAYS} days.`,
+        );
         continue;
       }
       const zero = (r.output ?? 0) === 0 ? " (nothing shipped)" : "";
       // "no note" is only innocent when nothing went wrong. A failed AI call says so,
       // otherwise an outage renders identically to a calm day.
       const state = r.posted
-        ? "note posted"
+        ? "feedback written"
         : r.alreadyCommented
         ? "already reviewed"
         : r.coachFailed
-        ? "NO NOTE, the coaching call failed"
-        : "no note";
+        ? "no feedback, the AI failed on this one"
+        : "no feedback";
       details.push(
         `*${r.name}* (${r.lastDay}). Output ${r.output ?? "n/a"}${zero}. ${state}. ${r.rowUrl}`,
       );
@@ -595,7 +597,7 @@ export async function GET(request: Request) {
       details.push(weekly.text);
     } else if (isMonday && weeklyHealth.failures > 0) {
       // Say it is missing. A silently absent section reads like there was nothing to say.
-      details.push("*Week in review* is missing, the call that writes it failed.");
+      details.push("*Week in review* is missing, the AI that writes it failed.");
     }
 
     const action = escalations.length
@@ -626,14 +628,12 @@ export async function GET(request: Request) {
       const who = coachFailedNames.join(" and ");
       await notify({
         severity: "broken",
-        headline: `${who} got no EOD coaching note, the Anthropic API is failing`,
+        headline: `${who} got no feedback on today's scorecard, the AI that writes it is down`,
         details: [
-          `The coaching call failed on ${coachHealth.failures} of ${coachHealth.attempts} scorecards, so nothing was written on their rows in Notion.`,
-          coachHealth.lastError ? `Last error: ${snip(coachHealth.lastError, 240)}` : null,
-          "This is not a quiet day. Their scorecards are sitting unreviewed and every run will keep failing until the API works.",
+          `It failed on ${coachHealth.failures} of ${coachHealth.attempts} scorecards, so their rows in Notion are sitting there with nothing written on them.`,
+          "This is not a quiet day. Every run from here will go the same way until it recovers.",
         ],
-        action:
-          "Check status.anthropic.com and ANTHROPIC_API_KEY in Vercel, then re-run the digest.",
+        action: `Write a line on ${who}'s scorecard yourself today so they are not left hanging. If tomorrow's digest says the same thing, tell me.`,
         link,
         linkLabel,
       });
@@ -676,16 +676,15 @@ export async function GET(request: Request) {
     if (!dry) {
       await notify({
         severity: "broken",
-        headline: `The team EOD digest is dead, ${ROSTER.map((m) => m.name).join(
+        headline: `The team end of day digest is dead, ${ROSTER.map((m) => m.name).join(
           " and ",
         )} are going unreviewed`,
         details: [
-          "The cron threw before it could finish, so no coaching comment was posted in Notion and no digest was sent.",
-          `Error: ${snip(message, 300)}`,
-          "It will fail the same way every weekday until someone fixes it.",
+          "It stopped before it could finish, so nobody got feedback on their scorecard and no digest went out.",
+          "It will fail the same way every weekday until it is fixed.",
         ],
         action:
-          "Read the Vercel logs for /api/cron/team-eod-digest, fix the cause, then re-run it.",
+          "Reply on their scorecards yourself today so the team is not left waiting, and tell me the digest is down so I can get it running again.",
         link: `https://www.notion.so/${SCORECARDS_DB_ID}`,
         linkLabel: "Scorecards database",
       });
